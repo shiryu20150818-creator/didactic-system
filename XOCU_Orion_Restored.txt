@@ -1,0 +1,483 @@
+-- Orion版 XOCU（Kick / Kill / 相手操作 復元）
+-- UI: Orion | 危険機能: Kick・Kill・相手操作のみ戻し
+
+local OrionLib = loadstring(game:HttpGet("https://raw.githubusercontent.com/shlexware/Orion/main/source"))()
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TextChatService = game:GetService("TextChatService")
+local LocalPlayer = Players.LocalPlayer
+
+local Window = OrionLib:MakeWindow({
+    Name = "XOCU Orion",
+    HidePremium = false,
+    SaveConfig = true,
+    ConfigFolder = "XOCU_Orion",
+    IntroEnabled = true,
+    IntroText = "Kick/Kill/Target Restored"
+})
+
+-- ======================
+-- 状態
+-- ======================
+local selectedTarget = nil
+local spinningConnection = nil
+local spinSpeed = 5
+local PL_SpeedEnabled = false
+local PL_SpeedValue = 16
+local PL_SpeedConn = nil
+local jpEnabled = false
+local jpValue = 50
+local jpConn = nil
+local noclipEnabled = false
+local noclipConnection = nil
+
+local FlightSettings = {
+    Enabled = false,
+    Speed = 50,
+    BodyVelocity = nil,
+    BodyGyro = nil,
+    FlightConnection = nil,
+}
+
+-- ======================
+-- ユーティリティ
+-- ======================
+local function getHRP(plr)
+    return plr and plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHum(plr)
+    return plr and plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
+end
+
+local function getPlayerList()
+    local list = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            table.insert(list, p.DisplayName .. " (@" .. p.Name .. ")")
+        end
+    end
+    return list
+end
+
+local function resolvePlayer(displayStr)
+    if not displayStr then return nil end
+    local name = displayStr:match("@(.+)%)$") or displayStr
+    return Players:FindFirstChild(name)
+end
+
+local function sendChat(msg)
+    local ch = TextChatService.TextChannels:FindFirstChild("RBXGeneral")
+    if ch then
+        pcall(function() ch:SendAsync(msg) end)
+    else
+        pcall(function()
+            ReplicatedStorage.DefaultChatSystemChatEvents.SayMessageRequest:FireServer(msg, "All")
+        end)
+    end
+end
+
+-- ======================
+-- Main タブ（Movement）
+-- ======================
+local MainTab = Window:MakeTab({
+    Name = "Main",
+    Icon = "rbxassetid://4483345998",
+    PremiumOnly = false
+})
+
+local MoveSec = MainTab:AddSection({Name = "Movement"})
+
+MoveSec:AddToggle({
+    Name = "Spin Character",
+    Default = false,
+    Callback = function(Value)
+        if Value then
+            spinningConnection = RunService.Heartbeat:Connect(function()
+                local root = getHRP(LocalPlayer)
+                if root then
+                    root.CFrame = root.CFrame * CFrame.Angles(0, math.rad(spinSpeed), 0)
+                end
+            end)
+        else
+            if spinningConnection then
+                spinningConnection:Disconnect()
+                spinningConnection = nil
+            end
+        end
+    end
+})
+
+MoveSec:AddSlider({
+    Name = "Spin Speed",
+    Min = 1, Max = 50, Default = 5, Increment = 1,
+    Callback = function(v) spinSpeed = v end
+})
+
+MoveSec:AddToggle({
+    Name = "Walkspeed",
+    Default = false,
+    Callback = function(Value)
+        PL_SpeedEnabled = Value
+        if Value then
+            if PL_SpeedConn then PL_SpeedConn:Disconnect() end
+            PL_SpeedConn = RunService.RenderStepped:Connect(function()
+                if not PL_SpeedEnabled then return end
+                local hrp = getHRP(LocalPlayer)
+                local hum = getHum(LocalPlayer)
+                if hrp and hum then
+                    hrp.CFrame = hrp.CFrame + hum.MoveDirection * (PL_SpeedValue * 0.1)
+                end
+            end)
+        else
+            if PL_SpeedConn then PL_SpeedConn:Disconnect() PL_SpeedConn = nil end
+        end
+    end
+})
+
+MoveSec:AddSlider({
+    Name = "Walk Speed",
+    Min = 1, Max = 500, Default = 16, Increment = 1,
+    Callback = function(v) PL_SpeedValue = v end
+})
+
+MoveSec:AddToggle({
+    Name = "Jump Power",
+    Default = false,
+    Callback = function(Value)
+        jpEnabled = Value
+        if Value then
+            if jpConn then jpConn:Disconnect() end
+            jpConn = RunService.Heartbeat:Connect(function()
+                if not jpEnabled then return end
+                local hum = getHum(LocalPlayer)
+                if hum then hum.JumpPower = jpValue end
+            end)
+        else
+            if jpConn then jpConn:Disconnect() jpConn = nil end
+            local hum = getHum(LocalPlayer)
+            if hum then hum.JumpPower = 50 end
+        end
+    end
+})
+
+MoveSec:AddSlider({
+    Name = "Jump Power Value",
+    Min = 1, Max = 500, Default = 50, Increment = 1,
+    Callback = function(v)
+        jpValue = v
+        if jpEnabled then
+            local hum = getHum(LocalPlayer)
+            if hum then hum.JumpPower = jpValue end
+        end
+    end
+})
+
+local function cleanupFlight()
+    if FlightSettings.FlightConnection then
+        FlightSettings.FlightConnection:Disconnect()
+        FlightSettings.FlightConnection = nil
+    end
+    if FlightSettings.BodyVelocity then
+        FlightSettings.BodyVelocity:Destroy()
+        FlightSettings.BodyVelocity = nil
+    end
+    if FlightSettings.BodyGyro then
+        FlightSettings.BodyGyro:Destroy()
+        FlightSettings.BodyGyro = nil
+    end
+    local hum = getHum(LocalPlayer)
+    if hum then hum.PlatformStand = false end
+end
+
+local function setFlightState(enabled)
+    FlightSettings.Enabled = enabled
+    if not enabled then
+        cleanupFlight()
+        return
+    end
+    local hrp = getHRP(LocalPlayer)
+    local hum = getHum(LocalPlayer)
+    if not hrp or not hum then return end
+    cleanupFlight()
+    hum.PlatformStand = true
+    FlightSettings.BodyVelocity = Instance.new("BodyVelocity")
+    FlightSettings.BodyVelocity.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+    FlightSettings.BodyVelocity.Velocity = Vector3.zero
+    FlightSettings.BodyVelocity.Parent = hrp
+    FlightSettings.BodyGyro = Instance.new("BodyGyro")
+    FlightSettings.BodyGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+    FlightSettings.BodyGyro.P = 10000
+    FlightSettings.BodyGyro.Parent = hrp
+    FlightSettings.FlightConnection = RunService.RenderStepped:Connect(function()
+        if not FlightSettings.Enabled or not hrp or not hrp.Parent then return end
+        local cam = workspace.CurrentCamera
+        local move = Vector3.zero
+        if UserInputService:IsKeyDown(Enum.KeyCode.W) then move = move + cam.CFrame.LookVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.S) then move = move - cam.CFrame.LookVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.A) then move = move - cam.CFrame.RightVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.D) then move = move + cam.CFrame.RightVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.Space) then move = move + Vector3.new(0, 1, 0) end
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then move = move - Vector3.new(0, 1, 0) end
+        if move.Magnitude > 0 then move = move.Unit * FlightSettings.Speed end
+        FlightSettings.BodyVelocity.Velocity = move
+        FlightSettings.BodyGyro.CFrame = cam.CFrame
+    end)
+end
+
+MoveSec:AddToggle({
+    Name = "Flight",
+    Default = false,
+    Callback = function(v) setFlightState(v) end
+})
+
+MoveSec:AddSlider({
+    Name = "Flight Speed",
+    Min = 10, Max = 500, Default = 50, Increment = 5,
+    Callback = function(v) FlightSettings.Speed = v end
+})
+
+MoveSec:AddToggle({
+    Name = "Noclip",
+    Default = false,
+    Callback = function(Value)
+        noclipEnabled = Value
+        if Value then
+            if noclipConnection then noclipConnection:Disconnect() end
+            noclipConnection = RunService.Stepped:Connect(function()
+                if not noclipEnabled then return end
+                local char = LocalPlayer.Character
+                if char then
+                    for _, part in ipairs(char:GetDescendants()) do
+                        if part:IsA("BasePart") then
+                            part.CanCollide = false
+                        end
+                    end
+                end
+            end)
+        else
+            if noclipConnection then
+                noclipConnection:Disconnect()
+                noclipConnection = nil
+            end
+        end
+    end
+})
+
+-- ======================
+-- Target タブ（Kick / Kill / 相手操作）
+-- ======================
+local TargetTab = Window:MakeTab({
+    Name = "Target",
+    Icon = "rbxassetid://10360632826",
+    PremiumOnly = false
+})
+
+local TargetSec = TargetTab:AddSection({Name = "Select & Actions"})
+
+local targetDropdown = TargetSec:AddDropdown({
+    Name = "Select Player",
+    Default = "",
+    Options = getPlayerList(),
+    Callback = function(Value)
+        selectedTarget = resolvePlayer(Value)
+        if selectedTarget then
+            OrionLib:MakeNotification({
+                Name = "Target",
+                Content = "選択: " .. selectedTarget.DisplayName,
+                Time = 3
+            })
+        end
+    end
+})
+
+TargetSec:AddButton({
+    Name = "Refresh Player List",
+    Callback = function()
+        targetDropdown:Refresh(getPlayerList(), true)
+    end
+})
+
+Players.PlayerAdded:Connect(function()
+    task.wait(0.5)
+    pcall(function() targetDropdown:Refresh(getPlayerList(), true) end)
+end)
+Players.PlayerRemoving:Connect(function()
+    task.wait(0.3)
+    pcall(function() targetDropdown:Refresh(getPlayerList(), true) end)
+end)
+
+-- Kill
+TargetSec:AddButton({
+    Name = "Kill Target",
+    Callback = function()
+        if not selectedTarget then
+            OrionLib:MakeNotification({Name = "Error", Content = "ターゲット未選択", Time = 3})
+            return
+        end
+        local hum = getHum(selectedTarget)
+        if hum then
+            hum.Health = 0
+            OrionLib:MakeNotification({Name = "Kill", Content = selectedTarget.DisplayName .. " をKill", Time = 3})
+        end
+    end
+})
+
+-- Kick（クライアント側Kick。相手に効くのは自分のキャラに対してのみ）
+TargetSec:AddButton({
+    Name = "Kick Target (Client)",
+    Callback = function()
+        if not selectedTarget then
+            OrionLib:MakeNotification({Name = "Error", Content = "ターゲット未選択", Time = 3})
+            return
+        end
+        pcall(function()
+            selectedTarget:Kick("Kicked by " .. LocalPlayer.DisplayName)
+        end)
+        OrionLib:MakeNotification({Name = "Kick", Content = selectedTarget.DisplayName .. " にKick送信", Time = 3})
+    end
+})
+
+-- Bring
+TargetSec:AddButton({
+    Name = "Bring Target",
+    Callback = function()
+        if not selectedTarget then
+            OrionLib:MakeNotification({Name = "Error", Content = "ターゲット未選択", Time = 3})
+            return
+        end
+        local myHRP = getHRP(LocalPlayer)
+        local tHRP = getHRP(selectedTarget)
+        if myHRP and tHRP then
+            tHRP.CFrame = myHRP.CFrame * CFrame.new(0, 0, -3)
+            OrionLib:MakeNotification({Name = "Bring", Content = selectedTarget.DisplayName .. " を呼んだ", Time = 3})
+        end
+    end
+})
+
+-- Freeze
+TargetSec:AddButton({
+    Name = "Freeze Target",
+    Callback = function()
+        if not selectedTarget then return end
+        local hrp = getHRP(selectedTarget)
+        if hrp then
+            hrp.Anchored = true
+            OrionLib:MakeNotification({Name = "Freeze", Content = selectedTarget.DisplayName .. " を凍結", Time = 3})
+        end
+    end
+})
+
+TargetSec:AddButton({
+    Name = "Unfreeze Target",
+    Callback = function()
+        if not selectedTarget then return end
+        local hrp = getHRP(selectedTarget)
+        if hrp then
+            hrp.Anchored = false
+            OrionLib:MakeNotification({Name = "Unfreeze", Content = selectedTarget.DisplayName .. " を解除", Time = 3})
+        end
+    end
+})
+
+-- Fling
+TargetSec:AddButton({
+    Name = "Fling Target",
+    Callback = function()
+        if not selectedTarget then return end
+        local myHRP = getHRP(LocalPlayer)
+        local tHRP = getHRP(selectedTarget)
+        if myHRP and tHRP then
+            myHRP.CFrame = tHRP.CFrame
+            task.wait()
+            myHRP.AssemblyLinearVelocity = Vector3.new(9999, 9999, 9999)
+            OrionLib:MakeNotification({Name = "Fling", Content = selectedTarget.DisplayName .. " をFling", Time = 3})
+        end
+    end
+})
+
+-- Teleport to Target
+TargetSec:AddButton({
+    Name = "Goto Target",
+    Callback = function()
+        if not selectedTarget then return end
+        local myHRP = getHRP(LocalPlayer)
+        local tHRP = getHRP(selectedTarget)
+        if myHRP and tHRP then
+            myHRP.CFrame = tHRP.CFrame * CFrame.new(0, 0, 3)
+        end
+    end
+})
+
+-- Spin around Target
+local orbitConn = nil
+TargetSec:AddToggle({
+    Name = "Orbit Target",
+    Default = false,
+    Callback = function(Value)
+        if orbitConn then
+            orbitConn:Disconnect()
+            orbitConn = nil
+        end
+        if Value and selectedTarget then
+            orbitConn = RunService.Heartbeat:Connect(function()
+                local myHRP = getHRP(LocalPlayer)
+                local tHRP = getHRP(selectedTarget)
+                if myHRP and tHRP then
+                    local a = tick() * 2
+                    myHRP.CFrame = tHRP.CFrame * CFrame.new(math.cos(a) * 8, 2, math.sin(a) * 8)
+                end
+            end)
+        end
+    end
+})
+
+-- ======================
+-- Player タブ
+-- ======================
+local PlayerTab = Window:MakeTab({
+    Name = "Player",
+    Icon = "rbxassetid://2795572803",
+    PremiumOnly = false
+})
+
+local PlayerSec = PlayerTab:AddSection({Name = "Local"})
+
+PlayerSec:AddButton({
+    Name = "Reset Character",
+    Callback = function()
+        local hum = getHum(LocalPlayer)
+        if hum then hum.Health = 0 end
+    end
+})
+
+PlayerSec:AddButton({
+    Name = "Rejoin",
+    Callback = function()
+        game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+    end
+})
+
+-- ======================
+-- Misc
+-- ======================
+local MiscTab = Window:MakeTab({
+    Name = "Misc",
+    Icon = "rbxassetid://4370341699",
+    PremiumOnly = false
+})
+
+local MiscSec = MiscTab:AddSection({Name = "Info"})
+MiscSec:AddParagraph("Restored", "Kick / Kill / Bring / Freeze / Fling / Orbit を復元。\nAdmin・Exec・チャットコマンドシステムは削除済み。")
+
+OrionLib:MakeNotification({
+    Name = "Loaded",
+    Content = "Orion版（Kick/Kill/Target操作 復元）",
+    Image = "rbxassetid://4483345998",
+    Time = 5
+})
+
+OrionLib:Init()
